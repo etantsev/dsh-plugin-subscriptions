@@ -162,10 +162,11 @@ export class DeviceFlowManager {
       throw new Error(`${provider} device-code request failed (HTTP ${String(response.status)})`)
     }
     const wire = await response.json() as DeviceCodeWire
-    // Prefer the plain URL (the UI shows the code beside it); providers that
-    // only send the complete form (Kimi may leave verification_uri empty)
-    // still work, since that URL carries the code itself.
-    const verificationUrl = nonEmptyString(wire.verification_uri) ?? nonEmptyString(wire.verification_uri_complete)
+    // Prefer the complete form (RFC 8628 §3.3.1) when the provider sends one:
+    // Kimi's authorize page refuses to load without its `user_code` query
+    // parameter. GitHub sends only the plain URL, where the user types the
+    // code shown beside it.
+    const verificationUrl = nonEmptyString(wire.verification_uri_complete) ?? nonEmptyString(wire.verification_uri)
     if (typeof wire.device_code !== 'string' || wire.device_code.length === 0
       || typeof wire.user_code !== 'string' || wire.user_code.length === 0
       || verificationUrl === undefined) {

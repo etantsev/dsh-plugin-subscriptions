@@ -51,7 +51,7 @@ test('kimi device flow: form-encoded client id, X-Msh headers, full token respon
     seen.push({ url, headers: init?.headers as Record<string, string>, body: String(init?.body) })
     if (url === KIMI_DEVICE_CODE_URL) {
       return Promise.resolve(new Response(JSON.stringify({
-        device_code: 'dc', user_code: 'WXYZ-1234', verification_uri: '',
+        device_code: 'dc', user_code: 'WXYZ-1234', verification_uri: 'https://www.kimi.com/code/authorize_device',
         verification_uri_complete: 'https://www.kimi.com/code/authorize_device?user_code=WXYZ-1234',
         interval: 0.01, expires_in: 60,
       })))
@@ -62,7 +62,7 @@ test('kimi device flow: form-encoded client id, X-Msh headers, full token respon
   }) as typeof fetch
   const manager = new DeviceFlowManager()
   const attempt = await manager.start('kimi', { ...kimiDeviceFlow(), fetchFn })
-  // Kimi may leave verification_uri empty; the complete URL stands in.
+  // Kimi's page requires user_code in the query: the complete URL wins.
   assert.equal(attempt.verificationUrl, 'https://www.kimi.com/code/authorize_device?user_code=WXYZ-1234')
   const tokens = await attempt.waitTokens()
   assert.deepEqual(tokens, { accessToken: 'at', refreshToken: 'rt', expiresIn: 900, scope: 'kimi-code' })

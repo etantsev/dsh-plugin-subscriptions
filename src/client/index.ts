@@ -74,7 +74,7 @@ export function apply(ctx: ClientContext): void {
   // so other aria-modal dialogs (e.g. the attachment lightbox) are untouched.
   ctx.effect(() => {
     const style = document.createElement('style')
-    style.setAttribute('data-plugin', 'dsh-plugin-subscriptions')
+    style.setAttribute('data-plugin', 'dsh-plugin-subscriptions-kimi')
     style.textContent = 'div[role="dialog"][aria-modal="true"]:has(> nav) { padding-top: 14px; }'
     document.head.appendChild(style)
     return () => style.remove()

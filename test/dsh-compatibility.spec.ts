@@ -6,7 +6,7 @@ import semver from 'semver'
 // Resolve the repository manifest through its package self-reference, including
 // when this test runs from lib-test/test after TypeScript compilation.
 const require = createRequire(import.meta.url)
-const manifest = require('dsh-plugin-subscriptions/package.json') as {
+const manifest = require('dsh-plugin-subscriptions-kimi/package.json') as {
   peerDependencies: Record<string, string>
   engines?: { dsh?: string }
 }

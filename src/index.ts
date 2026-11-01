@@ -158,7 +158,7 @@ export type { RateLimitConfig, RateLimitWait } from './providers/rate-limit.js'
 export type { ProviderStatus } from './auth/rpc.js'
 export type { AntigravitySession, ClaudeSession, CodexSession, CopilotSession, GrokSession, KimiSession, ProviderId } from './auth/store.js'
 
-export const name = 'dsh-plugin-subscriptions'
+export const name = 'dsh-plugin-subscriptions-kimi'
 export const inject = ['llm']
 
 /** Default maximum provider idle time while one stream read is outstanding. */

@@ -35,7 +35,7 @@ const POLL_INTERVAL_MS = 2000
 const MODEL_FILTER_THRESHOLD = 8
 
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
-export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity'
+export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity' | 'kimi'
 
 /** One logged-in account as answered by the `status` endpoint. */
 export interface AccountStatus {
@@ -152,6 +152,7 @@ const PROVIDERS: readonly { id: SubscriptionProvider; name: string }[] = [
   { id: 'grok', name: 'Grok (X Premium)' },
   { id: 'copilot', name: 'GitHub Copilot' },
   { id: 'antigravity', name: 'Google Antigravity' },
+  { id: 'kimi', name: 'Kimi Code' },
 ]
 
 /** Human text of an action failure, SubscriptionsAuthError or not. */
@@ -461,7 +462,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [statuses, setStatuses] = useState<Partial<Record<SubscriptionProvider, ProviderStatus>>>({})
   const [errors, setErrors] = useState<Partial<Record<SubscriptionProvider, string>>>({})
   const [manualDrafts, setManualDrafts] = useState<Record<SubscriptionProvider, string>>({
-    codex: '', claude: '', grok: '', copilot: '', antigravity: '',
+    codex: '', claude: '', grok: '', copilot: '', antigravity: '', kimi: '',
   })
   /** Pending device-flow codes (copilot), shown while the attempt polls. */
   const [deviceCodes, setDeviceCodes] = useState<Partial<Record<SubscriptionProvider, { userCode: string; verificationUrl: string }>>>({})
@@ -646,7 +647,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setUsageErrors(prev => dropStale(prev, live))
   }, [statuses, usages, usageErrors, loadUsage])
 
-  const login = useCallback(async (provider: SubscriptionProvider, method?: 'oauth' | 'keychain'): Promise<void> => {
+  const login = useCallback(async (provider: SubscriptionProvider, method?: 'oauth' | 'keychain' | 'kimi.com' | 'kimi.ai'): Promise<void> => {
     if (rpc === undefined) return
     setProviderError(provider, undefined)
     try {
@@ -1001,7 +1002,18 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               )
             })}
             <div style={styles.actions}>
-              {!busy && accounts.length === 0 && (
+              {!busy && id === 'kimi' && (
+                <>
+                  {/* kimi.com and kimi.ai are separate account systems: the site picks the auth server. */}
+                  <button type="button" onClick={() => { void login(id, 'kimi.com') }}>
+                    {t(accounts.length === 0 ? 'loginVia' : 'addAccountVia', { site: 'kimi.com' })}
+                  </button>
+                  <button type="button" onClick={() => { void login(id, 'kimi.ai') }}>
+                    {t(accounts.length === 0 ? 'loginVia' : 'addAccountVia', { site: 'kimi.ai' })}
+                  </button>
+                </>
+              )}
+              {!busy && accounts.length === 0 && id !== 'kimi' && (
                 <button type="button" onClick={() => { void login(id) }}>
                   {t('login')}
                 </button>
@@ -1016,7 +1028,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   </button>
                 </>
               )}
-              {!busy && accounts.length > 0 && id !== 'claude' && (
+              {!busy && accounts.length > 0 && id !== 'claude' && id !== 'kimi' && (
                 <button type="button" onClick={() => { void login(id) }}>
                   {t('addAccount')}
                 </button>

@@ -110,8 +110,12 @@ export interface ProviderStatus {
   clientVersion?: CliVersion
 }
 
-/** How a Claude login should acquire credentials (other providers ignore it). */
-export type LoginMethod = 'oauth' | 'keychain'
+/**
+ * How a login should acquire credentials: Claude picks the OAuth browser flow
+ * or the Claude Code import; Kimi picks the site (`kimi.com` or `kimi.ai`)
+ * whose auth server issues the session. Other providers take none.
+ */
+export type LoginMethod = 'oauth' | 'keychain' | 'kimi.com' | 'kimi.ai'
 
 /** Proxy config operations behind the `proxyGet/proxySet/proxyTest` endpoints. */
 export interface ProxyConfigController {
@@ -364,7 +368,13 @@ function readModelDefaultInput(payload: unknown): { provider: ProviderId; model:
 function readLoginMethod(payload: unknown, provider: ProviderId): LoginMethod | undefined {
   const method = (payload as Record<string, unknown>).method
   if (method === undefined) return undefined
-  if (provider !== 'claude') throw new BadRequest('payload.method is only valid for claude')
+  if (provider === 'kimi') {
+    if (method !== 'kimi.com' && method !== 'kimi.ai') {
+      throw new BadRequest('payload.method must be "kimi.com" or "kimi.ai" for kimi')
+    }
+    return method
+  }
+  if (provider !== 'claude') throw new BadRequest('payload.method is only valid for claude and kimi')
   if (method !== 'oauth' && method !== 'keychain') {
     throw new BadRequest('payload.method must be "oauth" or "keychain"')
   }

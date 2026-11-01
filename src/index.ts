@@ -1,6 +1,6 @@
 /**
  * dsh-plugin-subscriptions: register OAuth-subscription LLM providers
- * (ChatGPT/Codex, Claude, Grok, GitHub Copilot, Google Antigravity) on `ctx.llm`, and expose the `/subscriptions-auth`
+ * (ChatGPT/Codex, Claude, Grok, GitHub Copilot, Google Antigravity, Kimi Code) on `ctx.llm`, and expose the `/subscriptions-auth`
  * RPC channel the web Settings page uses to run the logins. The token store
  * lives at `~/.dsh/plugins/subscriptions/auth.json`; the channel registers only when
  * a host `connection` service exists, so headless compositions load fine.
@@ -61,6 +61,7 @@ import type {
   CopilotSession,
   AntigravitySession,
   GrokSession,
+  KimiSession,
   ProviderId,
   StoredSession,
 } from './auth/store.js'
@@ -136,6 +137,16 @@ import {
   resolveAntigravityOAuthConfig,
 } from './providers/antigravity.js'
 import type { AntigravityRuntimeConfig } from './providers/antigravity.js'
+import {
+  completeKimiLogin,
+  fetchKimiUsage,
+  isKimiPermanentRefreshError,
+  KimiAdapter,
+  kimiDeviceFlow,
+  KIMI_PREEMPT_MS,
+  refreshKimi,
+} from './providers/kimi.js'
+import type { KimiSite } from './providers/kimi.js'
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
 import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
@@ -145,7 +156,7 @@ import { ProviderSettingsStore, PROVIDER_TOOLS, validatePreferences } from './pr
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { RateLimitConfig, RateLimitWait } from './providers/rate-limit.js'
 export type { ProviderStatus } from './auth/rpc.js'
-export type { AntigravitySession, ClaudeSession, CodexSession, CopilotSession, GrokSession, ProviderId } from './auth/store.js'
+export type { AntigravitySession, ClaudeSession, CodexSession, CopilotSession, GrokSession, KimiSession, ProviderId } from './auth/store.js'
 
 export const name = 'dsh-plugin-subscriptions'
 export const inject = ['llm']
@@ -182,6 +193,7 @@ export interface Config {
     grok?: ModelEntry[]
     copilot?: ModelEntry[]
     antigravity?: ModelEntry[]
+    kimi?: ModelEntry[]
   }
   /** Antigravity-specific OAuth and endpoint configuration. */
   antigravity?: AntigravityRuntimeConfig & {
@@ -209,7 +221,7 @@ export interface Config {
   }
 }
 
-const providerIdSchema = z.union(['codex', 'claude', 'grok', 'copilot', 'antigravity'])
+const providerIdSchema = z.union(['codex', 'claude', 'grok', 'copilot', 'antigravity', 'kimi'])
 const modelEntrySchema: z<ModelEntry> = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -226,7 +238,7 @@ const poolMemberSchema: z<PoolMemberRef> = z.object({
 })
 
 export const Config: z<Config> = z.object({
-  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot', 'antigravity']),
+  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot', 'antigravity', 'kimi']),
   codexClientVersion: z.string(),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   claudePromptCacheTtl: z.union(['5m', '1h']).default(DEFAULT_PROMPT_CACHE_TTL),
@@ -240,6 +252,7 @@ export const Config: z<Config> = z.object({
     grok: z.array(modelEntrySchema),
     copilot: z.array(modelEntrySchema),
     antigravity: z.array(modelEntrySchema),
+    kimi: z.array(modelEntrySchema),
   }),
   antigravity: z.object({
     clientId: z.string(),
@@ -293,6 +306,10 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
     { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', inputModalities: ['text', 'image'] },
     { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 Thinking', inputModalities: ['text', 'image'] },
   ],
+  // Static fallback only; the authenticated /coding/v1/models response wins.
+  kimi: [
+    { id: 'kimi-for-coding', name: 'Kimi for Coding', contextWindow: 262_144, inputModalities: ['text', 'image'] },
+  ],
 }
 
 /** Validate and detach the model catalog for every provider. */
@@ -309,6 +326,7 @@ function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry
     grok: resolve('grok'),
     copilot: resolve('copilot'),
     antigravity: resolve('antigravity'),
+    kimi: resolve('kimi'),
   }
 }
 
@@ -326,6 +344,11 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
     case 'grok': return (session as GrokSession).account
     case 'copilot': return (session as CopilotSession).account
     case 'antigravity': return (session as AntigravitySession).account
+    case 'kimi': {
+      const kimi = session as KimiSession
+      const site = kimi.site ?? 'kimi.com'
+      return kimi.account === undefined ? site : `${kimi.account} (${site})`
+    }
   }
 }
 
@@ -393,7 +416,7 @@ export class SubscriptionsAuthController implements AuthController {
 
   constructor(
     private readonly flows: OAuthFlowManager,
-    /** Device-flow attempts (copilot); polled in the background like the loopback flows. */
+    /** Device-flow attempts (copilot, kimi); polled in the background like the loopback flows. */
     private readonly deviceFlows: DeviceFlowManager,
     /** Announces an auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
     private readonly onAuthChanged: (provider: ProviderId, account?: string) => void,
@@ -519,12 +542,13 @@ export class SubscriptionsAuthController implements AuthController {
       this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
       return { authorizeUrl: attempt.authorizeUrl }
     }
-    if (provider === 'copilot') {
+    if (provider === 'copilot' || provider === 'kimi') {
       // Device flow: no redirect URI — the UI shows the user code while the
-      // background task polls GitHub for the token.
-      const attempt = await this.deviceFlows.start(provider, copilotDeviceFlow())
+      // background task polls the provider for the token.
+      const kimiSite = method === 'kimi.ai' ? 'kimi.ai' : 'kimi.com'
+      const attempt = await this.deviceFlows.start(provider, provider === 'kimi' ? kimiDeviceFlow(kimiSite) : copilotDeviceFlow())
       this.beginFinalizing(provider)
-      void this.completeDevice(provider, attempt)
+      void this.completeDevice(provider, attempt, kimiSite)
       return { authorizeUrl: attempt.verificationUrl, userCode: attempt.userCode }
     }
     const spec = provider === 'grok'
@@ -588,11 +612,12 @@ export class SubscriptionsAuthController implements AuthController {
     }
   }
 
-  /** Drive one device-flow attempt to a stored session (the copilot path of {@link complete}). */
-  private async completeDevice(provider: ProviderId, attempt: DeviceAttempt): Promise<void> {
+  /** Drive one device-flow attempt to a stored session (the copilot/kimi path of {@link complete}). */
+  private async completeDevice(provider: ProviderId, attempt: DeviceAttempt, kimiSite: KimiSite = 'kimi.com'): Promise<void> {
     try {
-      const githubToken = await attempt.waitToken()
-      const session = await completeCopilotLogin(githubToken)
+      const session: StoredSession = provider === 'kimi'
+        ? completeKimiLogin(await attempt.waitTokens(), kimiSite)
+        : await completeCopilotLogin(await attempt.waitToken())
       await this.persist(provider, session)
       this.lastError.delete(provider)
       this.onAuthChanged(provider, accountKeyOf(provider, session))
@@ -616,8 +641,9 @@ export class SubscriptionsAuthController implements AuthController {
       case 'grok':
         return exchangeGrokCode(code, attempt.pkce.verifier, attempt.redirectUri, attempt.pkce.challenge)
       case 'copilot':
+      case 'kimi':
         // Device flow: exchange happens in completeDevice, never here.
-        return Promise.reject(new Error('copilot uses the device flow; no authorization code to exchange'))
+        return Promise.reject(new Error(`${provider} uses the device flow; no authorization code to exchange`))
       case 'antigravity':
         return exchangeAntigravityCode(
           code,
@@ -1018,6 +1044,38 @@ export function apply(ctx: Context, config: Config): void {
         handles.set('antigravity', register('antigravity', adapter))
         break
       }
+      case 'kimi': {
+        const tokens = new AccountTokenManager<KimiSession>({
+          provider: 'kimi',
+          displayName: 'Kimi Code',
+          makeOptions: () => ({
+            preemptMs: KIMI_PREEMPT_MS,
+            refresh: refreshKimi,
+            isPermanent: isKimiPermanentRefreshError,
+          }),
+          onAccountRemoved: account => { authChanged('kimi', account) },
+        })
+        accountTokens.set('kimi', tokens as AccountTokenManager<StoredSession>)
+        usageFetchers.kimi = async (account, signal) =>
+          fetchKimiUsage(await tokens.session(account), proxiedFetch, signal)
+        const adapter = new KimiAdapter({
+          models: catalog.kimi,
+          streamIdleTimeoutMs,
+          rateLimit,
+          tokens,
+          discovery: !overridden.has('kimi'),
+          onWarn,
+          resolveAttachments,
+          catalogStore: catalogStore('kimi'),
+          onCatalogChanged: catalogChanged,
+          accountCatalogStore: account => accountCatalogStore('kimi', account),
+          defaultEffortOf: model => defaultEffortOf('kimi', model),
+          pool: () => poolAdapter,
+        })
+        adapters.set('kimi', adapter)
+        handles.set('kimi', register('kimi', adapter))
+        break
+      }
     }
   }
 
@@ -1063,6 +1121,11 @@ export function apply(ctx: Context, config: Config): void {
             await tokens.session(account) as AntigravitySession, config.antigravity, proxiedFetch,
             AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS),
           )
+        }
+        case 'kimi': {
+          const fetcher = usageFetchers.kimi
+          return fetcher === undefined ? undefined : () =>
+            fetcher(account, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
         }
         case 'copilot':
           return undefined

@@ -33,12 +33,18 @@ function toolResultText(block: ResolvedToolResultBlock): string {
  * reject content-part arrays); tool results become separate `tool` messages.
  * @param messages - ordered conversation messages with resolved images.
  * @param system - explicit system prompt, which takes precedence.
+ * @param options - `replayReasoning` re-sends assistant reasoning as
+ *   `reasoning_content` (Kimi/Moonshot preserved thinking requires it on
+ *   assistant turns) and omits an empty `content` beside tool calls (Kimi
+ *   rejects empty assistant text).
  * @returns the wire `messages` array.
  */
 export function toChatMessages(
   messages: readonly TranslatableMessage[],
   system?: string,
+  options?: { replayReasoning?: boolean },
 ): Record<string, unknown>[] {
+  const replayReasoning = options?.replayReasoning === true
   const out: Record<string, unknown>[] = []
   const systemTexts: string[] = []
   for (const message of withToolResultImages(messages)) {
@@ -106,11 +112,19 @@ export function toChatMessages(
     }
     // assistant: text becomes content, tool calls become the tool_calls array.
     const texts: string[] = []
+    const reasoningTexts: string[] = []
+    let sawReasoning = false
     const toolCalls: Record<string, unknown>[] = []
     for (const block of message.content) {
       switch (block.type) {
         case 'text':
           texts.push(block.text)
+          break
+        case 'reasoning':
+          if (replayReasoning) {
+            sawReasoning = true
+            reasoningTexts.push(block.text)
+          }
           break
         case 'tool-call':
           toolCalls.push({
@@ -125,9 +139,11 @@ export function toChatMessages(
       }
     }
     if (texts.length === 0 && toolCalls.length === 0) continue
+    const content = texts.join('\n')
     out.push({
       role: 'assistant',
-      content: texts.join('\n'),
+      ...replayReasoning && toolCalls.length > 0 && content.trim().length === 0 ? {} : { content },
+      ...sawReasoning ? { reasoning_content: reasoningTexts.join('') } : {},
       ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
     })
   }

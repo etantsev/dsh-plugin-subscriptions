@@ -20,10 +20,10 @@ import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** Provider routes this plugin can serve. */
-export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity'
+export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity' | 'kimi'
 
 /** Every provider route, in display order. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot', 'antigravity']
+export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot', 'antigravity', 'kimi']
 
 /** Stored ChatGPT/Codex subscription session. */
 export interface CodexSession {
@@ -104,6 +104,20 @@ export interface AntigravitySession {
   scopes?: string
 }
 
+/** Stored Kimi Code (kimi.com / kimi.ai membership) session from the OAuth device flow. */
+export interface KimiSession {
+  /** Issuing site; absent means kimi.com. Refresh and API calls go to this site. */
+  site?: 'kimi.com' | 'kimi.ai'
+  accessToken: string
+  /** Rotated on every refresh. */
+  refreshToken: string
+  /** Epoch milliseconds at which the access token expires. */
+  expiresAt: number
+  scope?: string
+  /** Display identity from the access token's claims, when present. */
+  account?: string
+}
+
 /** One provider's accounts: account key → session, plus the default account. */
 export interface ProviderAccounts<S> {
   /** Key of the account direct (non-pool) routes serve; the first login wins. */
@@ -120,10 +134,11 @@ export interface SessionMap {
   grok?: ProviderAccounts<GrokSession>
   copilot?: ProviderAccounts<CopilotSession>
   antigravity?: ProviderAccounts<AntigravitySession>
+  kimi?: ProviderAccounts<KimiSession>
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
-export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession | AntigravitySession
+export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession | AntigravitySession | KimiSession
 
 /** The session type one provider stores. */
 export type SessionOf<K extends ProviderId> = NonNullable<SessionMap[K]>['accounts'][string]
@@ -169,6 +184,14 @@ export function accountKeyOf(provider: ProviderId, session: StoredSession): stri
       return (session as AntigravitySession).account ?? tokenHash(session.refreshToken)
     case 'copilot':
       return (session as CopilotSession).account ?? tokenHash(session.refreshToken)
+    case 'kimi': {
+      // Refresh tokens rotate, so the hash fallback keys on the first one
+      // only; re-logins without a claim identity land as a new account.
+      const kimi = session as KimiSession
+      const base = kimi.account ?? tokenHash(session.refreshToken)
+      // Sites run separate account systems: the same id on both stays two accounts.
+      return kimi.site === 'kimi.ai' ? `kimi.ai:${base}` : base
+    }
   }
 }
 

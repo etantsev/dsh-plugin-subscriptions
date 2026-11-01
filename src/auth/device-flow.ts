@@ -1,6 +1,6 @@
 /**
- * GitHub OAuth device-authorization flow (RFC 8628) for providers that cannot
- * use the loopback redirect engine: no redirect URI, no PKCE, no client
+ * OAuth device-authorization flow (RFC 8628) — GitHub Copilot and Kimi Code —
+ * for providers that cannot use the loopback redirect engine: no redirect URI, no PKCE, no client
  * secret. The user opens a verification URL and types a short code while the
  * plugin polls the token endpoint until GitHub releases the access token.
  * The management model (one attempt per provider, `isBusy`/`pending`/`cancel`)
@@ -19,14 +19,29 @@ const DEFAULT_EXPIRES_IN_SEC = 900
 export interface DeviceFlowSpec {
   /** OAuth App / GitHub App client id the device code is requested for. */
   clientId: string
-  /** Scope string requested at device-code time. */
-  scope: string
+  /** Scope string requested at device-code time; omitted from the request when absent. */
+  scope?: string
   /** Device-code endpoint (e.g. `https://github.com/login/device/code`). */
   deviceCodeUrl: string
   /** Token polling endpoint (e.g. `https://github.com/login/oauth/access_token`). */
   tokenUrl: string
+  /** Extra headers sent on the device-code and token-poll requests (e.g. Kimi's `X-Msh-*` device identity). */
+  headers?: Record<string, string>
+  /** Provider name used in user-facing messages (defaults to the provider route). */
+  displayName?: string
   /** Fetch implementation (injectable for tests). */
   fetchFn?: typeof fetch
+}
+
+/** The full token response a device flow released. */
+export interface DeviceTokenResult {
+  accessToken: string
+  /** OAuth refresh token, when the provider issues one (GitHub's OAuth App flow does not). */
+  refreshToken?: string
+  /** Access-token lifetime in seconds, when disclosed. */
+  expiresIn?: number
+  /** Granted scope string, when disclosed. */
+  scope?: string
 }
 
 /** One in-flight device-flow login attempt. */
@@ -40,6 +55,8 @@ export interface DeviceAttempt {
    * @returns the GitHub OAuth access token; rejects on timeout, denial, or cancel.
    */
   waitToken(): Promise<string>
+  /** Like {@link waitToken}, but resolves the whole token response (refresh token, lifetime). */
+  waitTokens(): Promise<DeviceTokenResult>
   /** Abort the attempt; `waitToken` rejects with a cancellation error. */
   cancel(): void
 }
@@ -49,6 +66,8 @@ interface DeviceCodeWire {
   device_code?: string
   user_code?: string
   verification_uri?: string
+  /** RFC 8628 §3.3.1: verification URL with the user code embedded. */
+  verification_uri_complete?: string
   interval?: number
   expires_in?: number
 }
@@ -56,8 +75,15 @@ interface DeviceCodeWire {
 /** Raw token-poll response shape (subset): success or an RFC 8628 error code. */
 interface DeviceTokenWire {
   access_token?: string
+  refresh_token?: string
+  expires_in?: number | string
+  scope?: string
   error?: string
   error_description?: string
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 /** Sleep for `ms`, rejecting early when the signal aborts. */
@@ -118,21 +144,31 @@ export class DeviceFlowManager {
       throw new Error(`a ${provider} login attempt is already in progress`)
     }
     const fetchFn = spec.fetchFn ?? proxiedFetch
+    const label = spec.displayName ?? provider
+    const headers = {
+      ...spec.headers,
+      'accept': 'application/json',
+      'content-type': 'application/x-www-form-urlencoded',
+    }
     const response = await fetchFn(spec.deviceCodeUrl, {
       method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'content-type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ client_id: spec.clientId, scope: spec.scope }).toString(),
+      headers,
+      body: new URLSearchParams({
+        client_id: spec.clientId,
+        ...spec.scope === undefined ? {} : { scope: spec.scope },
+      }).toString(),
     })
     if (!response.ok) {
       throw new Error(`${provider} device-code request failed (HTTP ${String(response.status)})`)
     }
     const wire = await response.json() as DeviceCodeWire
+    // Prefer the plain URL (the UI shows the code beside it); providers that
+    // only send the complete form (Kimi may leave verification_uri empty)
+    // still work, since that URL carries the code itself.
+    const verificationUrl = nonEmptyString(wire.verification_uri) ?? nonEmptyString(wire.verification_uri_complete)
     if (typeof wire.device_code !== 'string' || wire.device_code.length === 0
       || typeof wire.user_code !== 'string' || wire.user_code.length === 0
-      || typeof wire.verification_uri !== 'string' || wire.verification_uri.length === 0) {
+      || verificationUrl === undefined) {
       throw new Error(`${provider} device-code response is missing device_code/user_code/verification_uri`)
     }
     const intervalSec = typeof wire.interval === 'number' && wire.interval > 0
@@ -143,9 +179,9 @@ export class DeviceFlowManager {
       : DEFAULT_EXPIRES_IN_SEC
 
     const controller = new AbortController()
-    let resolveToken!: (token: string) => void
+    let resolveToken!: (token: DeviceTokenResult) => void
     let rejectToken!: (error: Error) => void
-    const tokenPromise = new Promise<string>((resolve, reject) => {
+    const tokenPromise = new Promise<DeviceTokenResult>((resolve, reject) => {
       resolveToken = resolve
       rejectToken = reject
     })
@@ -153,7 +189,7 @@ export class DeviceFlowManager {
     // rejection must not surface if nobody awaited waitToken after a cancel.
     tokenPromise.catch(() => undefined)
 
-    const settle = (error?: Error, token?: string): void => {
+    const settle = (error?: Error, token?: DeviceTokenResult): void => {
       // Identity check: a late settle from a stale attempt (its poll loop or a
       // cancel arriving after it already settled) must not kill a NEW attempt
       // the user started for the same provider.
@@ -174,10 +210,7 @@ export class DeviceFlowManager {
         }
         const pollResponse = await fetchFn(spec.tokenUrl, {
           method: 'POST',
-          headers: {
-            'accept': 'application/json',
-            'content-type': 'application/x-www-form-urlencoded',
-          },
+          headers,
           body: new URLSearchParams({
             client_id: spec.clientId,
             device_code: wire.device_code as string,
@@ -187,7 +220,13 @@ export class DeviceFlowManager {
         })
         const result = await pollResponse.json() as DeviceTokenWire
         if (typeof result.access_token === 'string' && result.access_token.length > 0) {
-          settle(undefined, result.access_token)
+          const expiresIn = Number(result.expires_in)
+          settle(undefined, {
+            accessToken: result.access_token,
+            ...nonEmptyString(result.refresh_token) === undefined ? {} : { refreshToken: result.refresh_token as string },
+            ...Number.isFinite(expiresIn) && expiresIn > 0 ? { expiresIn } : {},
+            ...nonEmptyString(result.scope) === undefined ? {} : { scope: result.scope as string },
+          })
           return
         }
         switch (result.error) {
@@ -198,7 +237,7 @@ export class DeviceFlowManager {
             intervalMs += 5000
             break
           case 'access_denied':
-            settle(new Error('login declined on the GitHub authorization page'))
+            settle(new Error(`login declined on the ${label} authorization page`))
             return
           case 'expired_token':
             settle(new Error('the device code expired before authorization completed'))
@@ -213,9 +252,10 @@ export class DeviceFlowManager {
     }
 
     const attempt: DeviceAttempt = {
-      verificationUrl: wire.verification_uri,
+      verificationUrl,
       userCode: wire.user_code,
-      waitToken: () => tokenPromise,
+      waitToken: () => tokenPromise.then(token => token.accessToken),
+      waitTokens: () => tokenPromise,
       cancel: () => {
         controller.abort(new Error('login cancelled'))
         settle(new Error('login cancelled'))

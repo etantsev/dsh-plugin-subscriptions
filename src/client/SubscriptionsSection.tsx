@@ -76,6 +76,8 @@ interface StatusResponse {
 export interface UsageWindow {
   kind: 'session' | 'weekly' | 'other'
   scope?: string
+  /** Explicit provider-supplied label, when present. */
+  label?: string
   usedPercent: number
   resetsAt?: number
 }

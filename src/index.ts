@@ -142,6 +142,7 @@ import {
   fetchKimiUsage,
   isKimiPermanentRefreshError,
   KimiAdapter,
+  kimiAccountLabel,
   kimiDeviceFlow,
   KIMI_PREEMPT_MS,
   refreshKimi,
@@ -344,11 +345,7 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
     case 'grok': return (session as GrokSession).account
     case 'copilot': return (session as CopilotSession).account
     case 'antigravity': return (session as AntigravitySession).account
-    case 'kimi': {
-      const kimi = session as KimiSession
-      const site = kimi.site ?? 'kimi.com'
-      return kimi.account === undefined ? site : `${kimi.account} (${site})`
-    }
+    case 'kimi': return kimiAccountLabel(session as KimiSession)
   }
 }
 

@@ -180,15 +180,36 @@ export function kimiDeviceFlow(site: KimiSite = DEFAULT_KIMI_SITE): DeviceFlowSp
   }
 }
 
-/** Best-effort display identity from the access token's claims. */
-function kimiAccountOf(accessToken: string): string | undefined {
-  const claims = decodeJwtPayload(accessToken)
+function claimString(claims: Record<string, unknown> | undefined, keys: readonly string[]): string | undefined {
   if (claims === undefined) return undefined
-  for (const key of ['email', 'phone', 'name', 'preferred_username', 'user_id', 'sub']) {
+  for (const key of keys) {
     const value = claims[key]
     if (typeof value === 'string' && value.trim().length > 0) return value.trim()
   }
   return undefined
+}
+
+/** Stable internal identity; Kimi's coding token normally carries only this. */
+function kimiSubjectOf(accessToken: string): string | undefined {
+  return claimString(decodeJwtPayload(accessToken), ['user_id', 'sub'])
+}
+
+/** Best-effort human identity. Internal user ids are deliberately excluded. */
+function kimiAccountOf(accessToken: string): string | undefined {
+  return claimString(decodeJwtPayload(accessToken), ['email', 'phone', 'name', 'preferred_username', 'nickname'])
+}
+
+/**
+ * Account label for Settings and the usage badge. Kimi's coding token cannot
+ * query the web profile and usually contains no login, so show the site rather
+ * than exposing its opaque internal user id.
+ */
+export function kimiAccountLabel(session: KimiSession): string {
+  const site = session.site ?? 'kimi.com'
+  const subject = session.subject ?? kimiSubjectOf(session.accessToken)
+  const account = kimiAccountOf(session.accessToken)
+    ?? (session.account !== undefined && session.account !== subject ? session.account : undefined)
+  return account === undefined ? site : `${account} (${site})`
 }
 
 /** Expiry from `expires_in`, falling back to the JWT `exp` claim, then 15 minutes. */
@@ -211,11 +232,13 @@ export function completeKimiLogin(tokens: DeviceTokenResult, site: KimiSite = DE
     throw new Error('kimi token endpoint returned no refresh_token')
   }
   const account = kimiAccountOf(tokens.accessToken)
+  const subject = kimiSubjectOf(tokens.accessToken)
   return {
     accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken,
     expiresAt: expiryOf(tokens.accessToken, tokens.expiresIn),
     ...tokens.scope === undefined ? {} : { scope: tokens.scope },
+    ...subject === undefined ? {} : { subject },
     ...account === undefined ? {} : { account },
     // kimi.com stays implicit so sessions keep their pre-site shape.
     ...site === 'kimi.ai' ? { site } : {},
@@ -253,7 +276,10 @@ export async function refreshKimi(session: KimiSession, fetchFn: FetchFn = proxi
   if (typeof wire.access_token !== 'string' || wire.access_token.length === 0) {
     throw new Error('kimi token endpoint returned no access_token')
   }
-  const account = kimiAccountOf(wire.access_token) ?? session.account
+  const previousSubject = session.subject ?? kimiSubjectOf(session.accessToken)
+  const subject = kimiSubjectOf(wire.access_token) ?? previousSubject
+  const account = kimiAccountOf(wire.access_token)
+    ?? (session.account !== undefined && session.account !== previousSubject ? session.account : undefined)
   const scope = typeof wire.scope === 'string' && wire.scope.length > 0 ? wire.scope : session.scope
   return {
     accessToken: wire.access_token,
@@ -262,6 +288,7 @@ export async function refreshKimi(session: KimiSession, fetchFn: FetchFn = proxi
       : session.refreshToken,
     expiresAt: expiryOf(wire.access_token, wire.expires_in === undefined ? undefined : Number(wire.expires_in)),
     ...scope === undefined ? {} : { scope },
+    ...subject === undefined ? {} : { subject },
     ...account === undefined ? {} : { account },
     ...session.site === undefined ? {} : { site: session.site },
   }
@@ -370,6 +397,8 @@ function resetOf(data: Record<string, unknown>): number | undefined {
 }
 
 function usedPercentOf(data: Record<string, unknown>): number | undefined {
+  const ratio = toNumber(data.used_ratio ?? data.usedRatio)
+  if (ratio !== undefined) return Math.min(100, Math.max(0, ratio * 100))
   const limit = toNumber(data.limit)
   let used = toNumber(data.used)
   if (used === undefined) {
@@ -392,9 +421,10 @@ function windowMinutes(item: Record<string, unknown>, detail: Record<string, unk
 }
 
 /**
- * Parse a Kimi `/usages` payload into usage windows: the `usage` summary is
- * the weekly quota; each `limits[]` entry is a rolling window (the 5-hour
- * one shows as `session`).
+ * Parse a Kimi `/usages` payload into usage windows. The legacy `usage`
+ * summary is the weekly quota and each `limits[]` entry is a rolling window.
+ * Current kimi.ai responses instead expose `usages.limit_5h`,
+ * `usages.limit_month_total`, and `usages.limit_month_code` as used ratios.
  * @param payload - the parsed JSON body.
  * @returns the plugin's usage shape.
  */
@@ -417,6 +447,29 @@ export function parseKimiUsage(payload: unknown): ProviderUsage {
       ...typeof label === 'string' ? { scope: label } : {},
       ...resetsAt === undefined ? {} : { resetsAt },
     })
+  }
+  if (typeof root.usages === 'object' && root.usages !== null && !Array.isArray(root.usages)) {
+    const hasDetailedSession = windows.some(window => window.kind === 'session')
+    for (const [key, raw] of Object.entries(root.usages)) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const data = raw as Record<string, unknown>
+      const usedPercent = usedPercentOf(data)
+      if (usedPercent === undefined) continue
+      const session = /(?:^|_)5h(?:_|$)/.test(key)
+      if (session && hasDetailedSession) continue // `limits[]` carries exact counts for the same window.
+      const label = key === 'limit_month_total' ? 'Monthly total'
+        : key === 'limit_month_code' ? 'Monthly coding'
+          : key === 'limit_5h' ? undefined
+            : key.replace(/^limit_/, '').replaceAll('_', ' ')
+      const kind: UsageWindow['kind'] = session ? 'session' : key.includes('week') ? 'weekly' : 'other'
+      const resetsAt = resetOf(data)
+      windows.push({
+        kind,
+        usedPercent,
+        ...label === undefined ? {} : { label },
+        ...resetsAt === undefined ? {} : { resetsAt },
+      })
+    }
   }
   if (typeof root.usage === 'object' && root.usage !== null) {
     const summary = root.usage as Record<string, unknown>

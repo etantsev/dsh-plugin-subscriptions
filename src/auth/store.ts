@@ -114,7 +114,9 @@ export interface KimiSession {
   /** Epoch milliseconds at which the access token expires. */
   expiresAt: number
   scope?: string
-  /** Display identity from the access token's claims, when present. */
+  /** Stable internal user id from `user_id`/`sub`; never shown as the login. */
+  subject?: string
+  /** Human-readable identity from the access token's claims, when present. */
   account?: string
 }
 
@@ -188,7 +190,8 @@ export function accountKeyOf(provider: ProviderId, session: StoredSession): stri
       // Refresh tokens rotate, so the hash fallback keys on the first one
       // only; re-logins without a claim identity land as a new account.
       const kimi = session as KimiSession
-      const base = kimi.account ?? tokenHash(session.refreshToken)
+      // Legacy sessions kept the internal id in `account`, so retain that fallback.
+      const base = kimi.subject ?? kimi.account ?? tokenHash(session.refreshToken)
       // Sites run separate account systems: the same id on both stays two accounts.
       return kimi.site === 'kimi.ai' ? `kimi.ai:${base}` : base
     }

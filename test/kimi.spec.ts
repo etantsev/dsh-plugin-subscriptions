@@ -15,6 +15,7 @@ import { toChatMessages } from '../src/translate/chat-completions.js'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import {
   completeKimiLogin,
+  kimiAccountLabel,
   fetchKimiModels,
   isKimiPermanentRefreshError,
   kimiChatRequestBody,
@@ -82,7 +83,9 @@ test('kimi login: session carries refresh token, expiry, and claim identity', ()
   const before = Date.now()
   const session = completeKimiLogin({ accessToken: jwt({ user_id: 'u-42' }), refreshToken: 'rt', expiresIn: 900 })
   assert.equal(session.refreshToken, 'rt')
-  assert.equal(session.account, 'u-42')
+  assert.equal(session.subject, 'u-42')
+  assert.equal(session.account, undefined)
+  assert.equal(kimiAccountLabel(session), 'kimi.com')
   assert.ok(session.expiresAt >= before + 899_000)
   assert.throws(() => completeKimiLogin({ accessToken: 'at' }), /refresh_token/)
 })
@@ -135,6 +138,34 @@ test('kimi usage: rolling limits and the weekly summary become windows', () => {
   assert.equal(usage.supported, true)
   assert.deepEqual(usage.windows?.map(window => [window.kind, window.usedPercent]), [['session', 80], ['weekly', 25]])
   assert.equal(usage.windows?.[1].resetsAt, Date.parse('2030-01-01T00:00:00Z'))
+})
+
+test('kimi usage: current kimi.ai monthly ratios and detailed 5-hour window', () => {
+  const usage = parseKimiUsage({
+    limits: [{ window: { duration: 300, timeUnit: 'TIME_UNIT_MINUTE' }, detail: {
+      limit: '100', used: '22', remaining: '78', resetTime: '2026-11-03T22:55:48.836828Z',
+    } }],
+    usages: {
+      limit_5h: { used_ratio: 0.2232, reset_time: '2026-11-03T22:55:48Z' },
+      limit_month_total: { used_ratio: 0.0779, reset_time: '2026-12-02T00:00:00Z' },
+      limit_month_code: { used_ratio: 0.0735, reset_time: '2026-12-02T00:00:00Z' },
+    },
+  })
+  assert.deepEqual(usage.windows?.map(window => [window.label, window.kind, window.usedPercent]), [
+    [undefined, 'session', 22],
+    ['Monthly total', 'other', 7.79],
+    ['Monthly coding', 'other', 7.35],
+  ])
+  assert.equal(usage.windows?.[1].resetsAt, Date.parse('2026-12-02T00:00:00Z'))
+})
+
+test('kimi account label: legacy opaque ids become the site, human claims survive', () => {
+  const legacy = { accessToken: jwt({ user_id: 'u-42' }), refreshToken: 'rt', expiresAt: 0, account: 'u-42', site: 'kimi.ai' } as const
+  assert.equal(kimiAccountLabel(legacy), 'kimi.ai')
+  assert.equal(accountKeyOf('kimi', legacy), 'kimi.ai:u-42')
+  const named = completeKimiLogin({ accessToken: jwt({ user_id: 'u-42', email: 'me@example.com' }), refreshToken: 'rt' }, 'kimi.ai')
+  assert.equal(kimiAccountLabel(named), 'me@example.com (kimi.ai)')
+  assert.equal(accountKeyOf('kimi', named), 'kimi.ai:u-42')
 })
 
 test('kimi request body: thinking switch, cache key, reasoning replay', () => {

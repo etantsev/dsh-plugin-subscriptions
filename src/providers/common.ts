@@ -497,6 +497,8 @@ export interface UsageWindow {
   kind: 'session' | 'weekly' | 'other'
   /** Model scope for model-specific windows (e.g. `Opus`), when the provider names one. */
   scope?: string
+  /** Explicit display label (e.g. Kimi's `Monthly total`), when kind/scope are not enough. */
+  label?: string
   /** Percent of the window already consumed (0–100). */
   usedPercent: number
   /** Epoch milliseconds at which the window resets, when the provider discloses it. */

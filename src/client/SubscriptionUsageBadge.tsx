@@ -241,6 +241,7 @@ type Translate = (key: SubscriptionsKey, params?: Record<string, unknown>) => st
 
 /** Localized label of one usage window (kind, plus the model scope when named). */
 function usageWindowLabel(t: Translate, window: UsageWindow): string {
+  if (window.label !== undefined && window.label !== '') return window.label
   const base = window.kind === 'session'
     ? t('usageSession')
     : window.kind === 'weekly' ? t('usageWeekly') : t('usageWindow')

@@ -180,7 +180,7 @@ interface PoolHarness {
 function makePool(
   adapters: Partial<Record<ProviderId, FakeAdapter>>,
   options: {
-    strategy?: 'priority' | 'quota_aware'
+    strategy?: 'priority' | 'quota_aware' | 'quota_normalized'
     switchMargin?: number
     usage?: (provider: ProviderId, account: string) => (() => Promise<ProviderUsage>) | undefined
     families?: Map<string, PoolDefinition>
@@ -466,10 +466,39 @@ test('quota_aware: the most urgent window (soon reset, plenty left) wins', async
   assert.equal((chunks[0] as { text: string }).text, 'a2')
 })
 
-test('quota_aware: a window past the full mark gates its account out', async () => {
+for (const strategy of ['quota_aware', 'quota_normalized'] as const) test(`${strategy}: independently selects across mixed session and weekly windows`, async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  // a1: Session window has 3h left (ratio ~1.33), weekly window has 6d left (ratio ~1.05)
+  // a2: Session window has 5h left (ratio 1.0), weekly window has 36h (~1.5d) left with 95% quota (ratio ~4.4)
+  // Under absolute ms scoring, a1's 3h session would dwarf a2's 36h weekly window.
+  // Under normalized burn rate ratios, a2's expiring weekly quota correctly outranks a1.
+  const { pool } = makePool({ codex }, {
+    strategy,
+    usage: usageFetchers({
+      'codex/a1': {
+        supported: true,
+        windows: [
+          { kind: 'session', durationMs: 18000000, usedPercent: 20, resetsAt: Date.now() + 3 * 60 * 60_000 },
+          { kind: 'weekly', durationMs: 604800000, usedPercent: 10, resetsAt: Date.now() + 6 * 24 * 60 * 60_000 },
+        ],
+      },
+      'codex/a2': {
+        supported: true,
+        windows: [
+          { kind: 'session', durationMs: 18000000, usedPercent: 0, resetsAt: Date.now() + 5 * 60 * 60_000 },
+          { kind: 'weekly', durationMs: 604800000, usedPercent: 5, resetsAt: Date.now() + 36 * 60 * 60_000 },
+        ],
+      },
+    }),
+  })
+  const chunks = await collect(pool.stream(OPTIONS))
+  assert.equal((chunks[0] as { text: string }).text, strategy === 'quota_aware' ? 'a1' : 'a2')
+})
+
+for (const strategy of ['quota_aware', 'quota_normalized'] as const) test(`${strategy}: a near-full account is deferred behind a healthy account`, async () => {
   const codex = new FakeAdapter((_options, account) => serveOk(account))
   const { pool } = makePool({ codex }, {
-    strategy: 'quota_aware',
+    strategy,
     usage: usageFetchers({
       'codex/a1': windowUsage(50, 5 * 60 * 60_000),
       'codex/a2': windowUsage(96, 30 * 60_000),
@@ -477,6 +506,98 @@ test('quota_aware: a window past the full mark gates its account out', async () 
   })
   await collect(pool.stream(OPTIONS))
   assert.deepEqual(codex.accounts, ['a1'])
+})
+
+for (const strategy of ['priority', 'quota_aware', 'quota_normalized'] as const) {
+  for (const full of [100, 105]) test(`${strategy}: ${full}% never spends credits ahead of 95%`, async () => {
+    const codex = new FakeAdapter((_options, account) => serveOk(account))
+    const { pool } = makePool({ codex }, { strategy, usage: usageFetchers({
+      'codex/a1': windowUsage(full, 60_000),
+      'codex/a2': windowUsage(95, 86_400_000),
+    }) })
+    for (let i = 0; i < 3; i++) await collect(pool.stream({ ...OPTIONS, sessionId: SessionId('credits') }))
+    assert.deepEqual(codex.accounts, ['a2', 'a2', 'a2'])
+  })
+
+  test(`${strategy}: all exhausted accounts stop with actionable quota notice, without requests`, async () => {
+    const codex = new FakeAdapter(() => serveOk('would spend credits'))
+    const { pool, warnings } = makePool({ codex }, { strategy, usage: usageFetchers({
+      'codex/a1': windowUsage(100, 60_000),
+      'codex/a2': windowUsage(105, 120_000),
+    }) })
+    await assert.rejects(collect(pool.stream(OPTIONS)), (error: unknown) => {
+      assert.ok(error instanceof LlmError)
+      assert.equal(error.code, 'QUOTA')
+      assert.match(error.message, /all currently usable accounts.*exhausted subscription quota/)
+      assert.match(error.message, /no remaining Codex credits/)
+      assert.match(error.message, /Settings > Subscriptions/)
+      return true
+    })
+    assert.deepEqual(codex.accounts, [])
+    assert.ok(warnings.some(message => message.includes('exhausted subscription quota')))
+  })
+
+  test(`${strategy}: remaining credits keep a fully used account available after included quota`, async () => {
+    const codex = new FakeAdapter((_options, account) => serveOk(account))
+    const funded = { ...windowUsage(100, 60_000), credits: { hasCredits: true, unlimited: false, balance: '13677.11' } }
+    const { pool } = makePool({ codex }, { strategy, usage: usageFetchers({
+      'codex/a1': funded,
+      'codex/a2': windowUsage(100, 120_000),
+    }) })
+    await collect(pool.stream(OPTIONS))
+    assert.deepEqual(codex.accounts, ['a1'])
+  })
+
+  test(`${strategy}: included quota is spent before a credit-funded account`, async () => {
+    const codex = new FakeAdapter((_options, account) => serveOk(account))
+    const funded = { ...windowUsage(100, 60_000), credits: { hasCredits: true, unlimited: false, balance: '9' } }
+    const { pool } = makePool({ codex }, { strategy, usage: usageFetchers({
+      'codex/a1': funded,
+      'codex/a2': windowUsage(50, 86_400_000),
+    }) })
+    await collect(pool.stream(OPTIONS))
+    assert.deepEqual(codex.accounts, ['a2'])
+  })
+
+  test(`${strategy}: sticky account loses eligibility once exhausted and returns after reset`, async () => {
+    let firstUsed = 10
+    const codex = new FakeAdapter((_options, account) => serveOk(account))
+    const { pool, usage } = makePool({ codex }, { strategy,
+      usage: (_provider, account) => async () => windowUsage(account === 'a1' ? firstUsed : 96, 60_000),
+    })
+    const options = { ...OPTIONS, sessionId: SessionId('sticky-reset') }
+    await collect(pool.stream(options))
+    firstUsed = 100
+    usage.invalidate('codex', 'a1')
+    await collect(pool.stream(options))
+    assert.deepEqual(codex.accounts, ['a1', 'a2'])
+    firstUsed = 0
+    usage.invalidate('codex', 'a1')
+    // A new session has no priority stickiness to the second account.
+    await collect(pool.stream({ ...OPTIONS, sessionId: SessionId('after-reset') }))
+    assert.equal(codex.accounts.at(-1), 'a1')
+  })
+}
+
+test('quota_aware: near-full accounts rank by remaining quota rather than pool order', async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex }, { strategy: 'quota_aware', usage: usageFetchers({
+    'codex/a1': windowUsage(99, 86_400_000),
+    'codex/a2': windowUsage(95, 86_400_000),
+  }) })
+  await collect(pool.stream(OPTIONS))
+  assert.deepEqual(codex.accounts, ['a2'])
+})
+
+test('quota_aware: fallback failure never falls through to a known exhausted account', async () => {
+  const codex = new FakeAdapter((_options, account) => account === 'a1'
+    ? serveOk('would spend credits') : serveFail(new LlmError('offline', 'TRANSPORT')))
+  const { pool } = makePool({ codex }, { strategy: 'quota_aware', usage: usageFetchers({
+    'codex/a1': windowUsage(100, 60_000),
+    'codex/a2': windowUsage(95, 60_000),
+  }) })
+  await assert.rejects(collect(pool.stream(OPTIONS)))
+  assert.deepEqual(codex.accounts, ['a2'])
 })
 
 test('quota_aware: an account without telemetry sinks behind a measured one', async () => {
@@ -657,6 +778,57 @@ test('stream: request-fault failures rethrow without trying other accounts', asy
   assert.equal(health.isAvailable(memberKey('codex', 'a1', 'm')), true)
 })
 
+test('stream: an empty completion fails over without parking the member', async () => {
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1'
+      ? serveFail(new LlmError('model returned a completed response with no content', 'EMPTY_RESPONSE'))
+      : serveOk('a2'))
+  const { pool, health } = makePool({ codex })
+  const chunks = await collect(pool.stream(OPTIONS))
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
+  assert.equal(health.isMemberAvailable('codex', 'a1', 'm'), true)
+})
+
+test('stream: empty completions in one session do not stall another session', async () => {
+  const codex = new FakeAdapter((options, account) =>
+    options.sessionId === SessionId('poison')
+      ? serveFail(new LlmError('model returned a completed response with no content', 'EMPTY_RESPONSE'))
+      : serveOk(account))
+  const { pool } = makePool({ codex })
+  await assert.rejects(collect(pool.stream({ ...OPTIONS, sessionId: SessionId('poison') })), (error: unknown) => {
+    assert.ok(error instanceof LlmError)
+    assert.equal(error.code, 'EMPTY_RESPONSE')
+    assert.equal(error.failure.providerRetryAfterMs, undefined)
+    return true
+  })
+  const chunks = await collect(pool.stream({ ...OPTIONS, sessionId: SessionId('healthy') }))
+  assert.equal((chunks[0] as { text: string }).text, 'a1')
+  assert.deepEqual(codex.accounts, ['a1', 'a2', 'a1'])
+})
+
+for (const strategy of ['priority', 'quota_aware', 'quota_normalized'] as const) test(`stream: ${strategy} gives no wait when the member with an empty completion can retry at once`, async () => {
+  for (const limitMs of [60 * 60_000, 3 * 24 * 60 * 60_000]) {
+    let empties = 0
+    const codex = new FakeAdapter((_options, account) => {
+      if (account === 'a1') return serveFail(new LlmError('usage limit', 'RATE_LIMIT', { providerRetryAfterMs: limitMs }))
+      return empties++ === 0
+        ? serveFail(new LlmError('model returned a completed response with no content', 'EMPTY_RESPONSE'))
+        : serveOk(account)
+    })
+    const { pool, health } = makePool({ codex }, { strategy })
+    await assert.rejects(collect(pool.stream(OPTIONS)), (error: unknown) => {
+      assert.ok(error instanceof LlmError)
+      assert.equal(error.code, 'EMPTY_RESPONSE')
+      assert.equal(error.failure.providerRetryAfterMs, undefined, `a1's ${limitMs} ms limit must not set the wait`)
+      return true
+    })
+    assert.equal(health.isMemberAvailable('codex', 'a2', 'm'), true)
+    const chunks = await collect(pool.stream(OPTIONS))
+    assert.equal((chunks[0] as { text: string }).text, 'a2')
+    assert.deepEqual(codex.accounts, ['a1', 'a2', 'a2'])
+  }
+})
+
 test('stream: an empty first stream counts as a transient failure', async () => {
   const codex = new FakeAdapter((_options, account) =>
     account === 'a1' ? serveEmpty() : serveOk('a2'))
@@ -683,6 +855,28 @@ test('stream: an exhausted pool throws RATE_LIMIT with the earliest recovery hin
       return true
     },
   )
+})
+
+test('Codex stream overload preserves the reported seconds through pool exhaustion', async t => {
+  const now = Date.now()
+  t.mock.timers.enable({ apis: ['Date'], now })
+  const { ResponsesStreamTranslator } = await import('../src/translate/responses.js')
+  const codex = new FakeAdapter(async function* () {
+    new ResponsesStreamTranslator().push({ type: 'response.failed', response: { error: {
+      code: 'server_is_overloaded', message: 'busy', headers: { 'retry-after-ms': null, 'retry-after': '120' },
+    } } })
+  })
+  const { pool } = makePool({ codex })
+  for (const expected of [120000, 30000]) {
+    await assert.rejects(collect(pool.stream(OPTIONS)), (error: unknown) => {
+      assert.ok(error instanceof LlmError)
+      assert.equal(error.code, 'SERVER')
+      assert.equal(error.failure.providerRetryAfterMs, expected)
+      return true
+    })
+    assert.deepEqual(codex.accounts, ['a1', 'a2'])
+    t.mock.timers.tick(90000)
+  }
 })
 
 test('stream: a transport failure on a single-member pool is reported as TRANSPORT, not RATE_LIMIT (issue #139)', async () => {

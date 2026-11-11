@@ -501,6 +501,8 @@ export interface UsageWindow {
   label?: string
   /** Percent of the window already consumed (0–100). */
   usedPercent: number
+  /** Total window length when known from provider telemetry (not time left until reset). */
+  durationMs?: number
   /** Epoch milliseconds at which the window resets, when the provider discloses it. */
   resetsAt?: number
 }
@@ -512,14 +514,38 @@ export interface ResetCredit {
   expiresAt?: number
 }
 
+/**
+ * Purchased Codex credit balance from `wham/usage`. Distinct from
+ * {@link ResetCredit}: this is spendable balance, not a window-reset card.
+ */
+export interface CreditBalance {
+  /** Backend flag that a spendable balance exists. */
+  hasCredits: boolean
+  /** True when the backend reports an uncapped credit balance. */
+  unlimited: boolean
+  /** Remaining balance as reported (decimal string). Absent when undisclosed. */
+  balance?: string
+  /** True when the backend says credit spending itself is blocked. */
+  overageLimitReached?: boolean
+}
+
 /** Subscription usage of one provider, as served by the `usage` RPC endpoint. */
 export interface ProviderUsage {
+  /** Display-only telemetry; does not affect routing or cooldown decisions. */
+  fetchedAt?: number
+  staleAt?: number
+  stale?: boolean
+  refreshFailed?: boolean
+  retryAt?: number
+
   /** False when the provider has no usage endpoint (grok); windows are absent then. */
   supported: boolean
   /** Usage windows in display order. */
   windows?: UsageWindow[]
   /** Plan name the usage endpoint reported, when present. */
   plan?: string
+  /** Remaining purchased Codex credits, when `wham/usage` discloses them. */
+  credits?: CreditBalance
   /** Available banked Codex full resets, when the backend discloses them. */
   resetCredits?: ResetCredit[]
   /** Optional reset lookup failure; ordinary usage remains usable. */
@@ -550,6 +576,12 @@ export interface DiscoveredModel {
   inputModalities?: ('text' | 'image')[]
   /** Claude-specific: which extended-thinking wire shape this model accepts. */
   thinkingType?: 'enabled' | 'adaptive'
+  /** Antigravity's selectable roster and fixed SKU thinking settings. */
+  antigravity?: {
+    visible: boolean
+    thinkingLevel?: 'LOW' | 'MEDIUM' | 'HIGH'
+    thinkingBudget?: number
+  }
   /** Codex-specific: the catalog advertises a fast (priority) service tier. */
   fastTier?: boolean
   /** Copilot-specific: which upstream protocol the model's endpoints speak. */

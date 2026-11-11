@@ -2,8 +2,8 @@
  * Subscriptions settings section: one card per subscription provider with an
  * OAuth login/logout flow driven by the node half's `/subscriptions-auth` RPC
  * channel. Login state lives server-side; the page polls `status` only while
- * a login attempt is busy, so an idle page never polls. All state is local
- * React state — the page has no store.
+ * a login attempt is busy, so an idle page never polls. Usage snapshots also synchronize
+ * through a connection-local memory cache shared with the badge.
  *
  * Every color resolves through a `--dsw-alias-*` design token (the ui-theme
  * design-platform.css values flip under `body[data-ds-dark-theme]`), and
@@ -11,11 +11,16 @@
  * 'settings.subscriptions' namespace. Buttons and inputs take the
  * native settings vocabulary with shared, scoped control states.
  */
+import { creditBalanceText, quotaPercent, quotaText, UsageFreshness, useQuotaClock } from './quota-display.js'
+import { useQuotaDisplayMode } from './usage-badge-preferences.js'
+import { readUsageCache, subscribeUsage } from './usage-cache.js'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import { en } from './locales.js'
 import { resetActionBlock } from './reset-action.js'
+import { AntigravityQuotaSummary } from './AntigravityQuotaSummary.js'
+import { antigravityQuotaScope } from '../antigravity-model-id.js'
 import { visibleUsageWindows } from './usage-window-filter.js'
 import { ProviderAccountManager } from './ProviderAccountManager.js'
 import { providerSettingsCss } from './provider-settings-styles.js'
@@ -72,6 +77,14 @@ interface StatusResponse {
   providers: Record<SubscriptionProvider, ProviderStatus>
 }
 
+/** Purchased Codex credit balance. Not a usage-limit reset card. */
+export interface CreditBalance {
+  hasCredits: boolean
+  unlimited: boolean
+  balance?: string
+  overageLimitReached?: boolean
+}
+
 /** One rate-limit window as answered by the `usage` endpoint. */
 export interface UsageWindow {
   kind: 'session' | 'weekly' | 'other'
@@ -84,9 +97,20 @@ export interface UsageWindow {
 
 /** `usage` endpoint value: the node half owns this shape. */
 export interface ProviderUsage {
+  /** Browser receipt time, NOT proof of an upstream quota refresh. Memory-only. */
+  receivedAt?: number
+  /** Display-only telemetry; does not affect routing or cooldown decisions. */
+  fetchedAt?: number
+  staleAt?: number
+  stale?: boolean
+  refreshFailed?: boolean
+  retryAt?: number
+
   supported: boolean
   windows?: UsageWindow[]
   plan?: string
+  /** Remaining purchased Codex credits from `wham/usage`, when disclosed. */
+  credits?: CreditBalance
   resetCredits?: { id?: string; grantedAt?: number; expiresAt?: number }[]
   resetCreditsError?: string
 }
@@ -336,6 +360,7 @@ function usageWindowLabel(t: SubscriptionsSectionInjected['t'], window: UsageWin
 
 /** Bar fill color: success normally, warn from 80%, error from 95%. Shared with the composer badge. */
 export function usageBarColor(usedPercent: number): string {
+  if (!Number.isFinite(usedPercent)) return 'var(--dsw-alias-label-dimmed)'
   if (usedPercent >= 95) return 'var(--dsw-alias-state-error-primary)'
   if (usedPercent >= 80) return 'var(--dsw-alias-state-warn-label)'
   return 'var(--dsw-alias-state-success-primary)'
@@ -459,6 +484,8 @@ export function modelDefaultsSignature(
  * @returns the section body, or a notice while the RPC face is absent.
  */
 export function SubscriptionsSection(props: SubscriptionsSectionProps) {
+  const quotaMode = useQuotaDisplayMode()
+  const quotaNow = useQuotaClock()
   const { rpc } = props
   const t = props.t ?? fallbackTranslate
   const [statuses, setStatuses] = useState<Partial<Record<SubscriptionProvider, ProviderStatus>>>({})
@@ -601,6 +628,30 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       if (mountedRef.current) setUsageLoading(prev => ({ ...prev, [key]: false }))
     }
   }, [rpc])
+
+  // Synchronize existing telemetry without polling providers or invoking routing.
+  useEffect(() => {
+    if (!rpc) return
+    const sync = (key: string, usage: ProviderUsage) => {
+      const live = PROVIDERS.some(({ id }) => statuses[id]?.accounts.some(account => `${id}:${account.key}` === key))
+      if (!live) return
+      setUsages(previous => ({ ...previous, [key]: usage }))
+      if (!usage.refreshFailed) setUsageErrors(previous => {
+        const next = { ...previous }; delete next[key]; return next
+      })
+    }
+    const focus = () => {
+      for (const { id } of PROVIDERS) for (const account of statuses[id]?.accounts ?? []) {
+        const key = `${id}:${account.key}`
+        const usage = readUsageCache(rpc, key)
+        if (usage) sync(key, usage)
+      }
+    }
+    const unsubscribe = subscribeUsage(rpc, sync)
+    focus()
+    window.addEventListener('focus', focus)
+    return () => { unsubscribe(); window.removeEventListener('focus', focus) }
+  }, [rpc, statuses])
 
   async function prepareReset(account: string): Promise<void> {
     if (!rpc || resetInflight.current) return
@@ -881,9 +932,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               const nextReset = sortedCredits.find(c => c.expiresAt === undefined || c.expiresAt > Date.now())
               const resetBlock = usage ? resetActionBlock(usage) : 'resetUseRefresh'
               const resetDisabled = resetBusy || resetBlock !== undefined
-              // Providers without a usage endpoint answer supported:false — no block.
-              const showUsage = usage?.supported !== false
-                && (usage !== undefined || usageError !== undefined || usageLoading[usageKey] === true)
+              const showUsage = usage !== undefined || usageError !== undefined || usageLoading[usageKey] === true
               return (
                 <div key={account.key} style={styles.accountRow}>
                   <div style={styles.accountHeader}>
@@ -921,45 +970,52 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                         {usage?.plan !== undefined && (
                           <span style={styles.usagePlan}>{t('usagePlan', { plan: usage.plan })}</span>
                         )}
-                        <button
+                        {usage?.supported !== false && <button
                           type="button"
                           style={styles.usageRefresh}
                           disabled={usageLoading[usageKey] === true}
                           onClick={() => { void loadUsage(id, account.key, true) }}
                         >
                           {t('usageRefresh')}
-                        </button>
+                        </button>}
                       </div>
+                      {usage && <UsageFreshness usage={usage} t={t} />}
                       {usage === undefined && usageError === undefined && (
                         <p style={styles.statusLine}>{t('usageLoading')}</p>
                       )}
                       {usageError !== undefined && (
                         <p style={styles.errorLine}>{t('usageError', { message: usageError })}</p>
                       )}
-                      {usage?.windows !== undefined && usage.windows.length === 0 && (
-                        <p style={styles.statusLine}>{t('usageEmpty')}</p>
-                      )}
                       {usage?.windows !== undefined && usage.windows.length > 0 && shownWindows.length === 0 && (
                         <p style={styles.statusLine}>{t('usageNoVisibleModels')}</p>
                       )}
-                      {shownWindows.map((window, index) => {
-                        const percent = Math.min(100, Math.max(0, window.usedPercent))
+                      {id === 'antigravity' && shownWindows.some(window => antigravityQuotaScope(window.scope))
+                        ? <AntigravityQuotaSummary windows={shownWindows} t={t} mode={quotaMode} />
+                        : shownWindows.map((window, index) => {
+                        const percent = quotaPercent(window.usedPercent, quotaMode)
                         return (
                           <div key={index} style={styles.usageRow}>
                             <div style={styles.usageMeta}>
                               <span>{usageWindowLabel(t, window)}</span>
-                              <span>
-                                {`${String(Math.round(percent))}%`}
+                              <span style={{ color: usageBarColor(window.usedPercent) }}>
+                                {quotaText(window.usedPercent, quotaMode, t)}
                                 {window.resetsAt !== undefined
-                                  && ` · ${t('usageResets', { date: new Date(window.resetsAt).toLocaleString() })}`}
+                                  && ` · ${t('usageResets', { date: new Date(window.resetsAt).toLocaleString() })}${window.resetsAt <= quotaNow ? ` · ${t('quotaExpiredWindow')}` : ''}`}
                               </span>
                             </div>
-                            <div style={styles.usageTrack}>
-                              <div style={{ ...styles.usageFill, width: `${String(percent)}%`, background: usageBarColor(percent) }} />
+                            <div style={styles.usageTrack} aria-hidden>
+                              <div style={{ ...styles.usageFill, width: `${percent ?? 0}%`, background: usageBarColor(window.usedPercent) }} />
                             </div>
                           </div>
                         )
                       })}
+                      {id === 'codex' && creditBalanceText(usage?.credits, t) !== undefined && (
+                        <div style={styles.usageRow}>
+                          <div style={styles.usageMeta}>
+                            <span>{creditBalanceText(usage?.credits, t)}</span>
+                          </div>
+                        </div>
+                      )}
                       {id === 'codex' && usage?.resetCreditsError !== undefined && (
                         <p style={styles.errorLine}>{t('resetCreditsError', { message: usage.resetCreditsError })}</p>
                       )}

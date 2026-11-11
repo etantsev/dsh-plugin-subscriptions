@@ -10,6 +10,14 @@
 
 订阅显示名也用于原生模型选择器的服务商分组标题；清空显示名并保存后，分组恢复为服务商默认名称。
 
+## Antigravity 模型与推理强度选择
+
+将同一模型的 Low / Medium / High 变体合并为一个条目，复用 Codex 的原生模型与推理强度选择控件。存在时，`agentModelSorts` 决定可选模型及顺序，只合并其中明确的 Low / Medium / High 变体。`tieredModelIds` 中的 `pro` / `flashLite` 是分类键，不会创建模型或扩展列表。请求保留目录中的 `thinkingLevel` / `thinkingBudget`，旧的具体模型 ID 仍可用于历史会话。
+
+未设置有效偏好时，默认按 High、Medium、Low 的顺序选择可用强度。账号池沿用各成员能力交集。安装后请刷新模型目录；旧目录缺少官方列表元数据时只能按兼容规则过滤，真实账号的选择器与用量显示已有截图验证；所有模型及强度的实际请求仍需进一步验证。参见 [验证说明](docs/issue180-testing.md)。
+
+Antigravity 用量优先读取 `retrieveUserQuotaSummary`，只展示服务端明确返回的共享限额。Gemini 组包含 Argon；原生常见的两组（Gemini、Claude/GPT）各有周/5小时窗口，账户共享组不随模型白名单隐藏。设置页与订阅弹层复用分组展示，横条和百分比均表示剩余份额，不按Low/Medium/High重复列出。摘要缺少共享组时补读未覆盖的可选型号原始额度，不根据重置时间推断周期；补读失败保留有效摘要、取消向上传播。
+
 ## 演示
 
 设置 → **订阅**:每个 provider 的登录/退出,无需 API key。Claude 有 Claude Code 会话时导入凭据,否则和 Codex、Grok 一样走 OAuth(以下设置截图使用演示账号与目录数据):
@@ -38,9 +46,15 @@
 
 ![速度开关及其标准/快速菜单](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/speed-toggle.png)
 
-输入框下方的统计行会多出一个**订阅用量**胶囊，显示当前会话所选模型对应服务商的已用百分比和重置窗口（选 Codex 模型时显示 Codex，选 Grok 模型时显示 Grok，以此类推）。状态栏最多显示一家：切到非订阅模型时，保留当前会话视图中最近选择的订阅；没有记录则隐藏。最近模型记录不会跨页面刷新保存。点击可展开查看所有已登录服务商及其全部账号 —— 默认账号带星标，当前服务商排在最前。Antigravity 仅预览当前模型的额度窗口（每个账号最多两个），其余模型窗口默认折叠，仍可点击展开。
+输入框下方的统计行会多出一个**订阅用量**胶囊，显示当前会话所选模型对应服务商的额度信息（选 Codex 模型时显示 Codex，选 Grok 模型时显示 Grok，以此类推）。状态栏最多显示一家：切到非订阅模型时，保留当前会话视图中最近选择的订阅；没有记录则隐藏。最近模型记录不会跨页面刷新保存。点击可展开查看所有已登录服务商及其全部账号 —— 默认账号带星标，当前服务商排在最前。Antigravity 仅预览当前模型的额度窗口（每个账号最多两个），其余模型窗口默认折叠，仍可点击展开。
 
 在 **设置 → 订阅 → 状态栏额度显示** 中可选择 **仅显示当前／最近使用的一家**（默认）或 **不显示**。显示偏好自动保存到当前浏览器，立即生效、刷新后保留，并在同源标签页之间同步；不影响设置页的额度详情、模型选择或账号路由。
+
+独立的 **额度百分比** 选项可选择 **已用（默认）** 或 **剩余**，统一应用于设置页、输入框状态栏和展开后的账号详情。两项偏好都保存在当前浏览器，并在标签页之间同步。进度条按所选方向填充，告警颜色仍依据**已用**额度（80% 警告，95% 严重）。未知或无效数据不会显示为剩余 100%；重置时间已过时，保留最后上报值并明确提示等待刷新。
+
+多账号时，紧凑徽标显示例如“Codex · 2 个已登录账号”，展开后逐账号保留窗口、模型范围和重置时间，不对百分比求和或平均。已登录账号不一定属于当前模型的账号池。只有一个账号时明确标注默认或所列账号；默认星标和会话粘性记录都不能证明哪个账号成功服务了请求。
+
+设置页和展开详情显示最后成功获取时间、过期状态，以及刷新失败后的可重试时间；不支持查询、空结果、查询失败且无历史数据分别提示。旧后端未提供额度时间时，显示收到响应的时间，并明确说明未提供额度更新时间；收到响应不代表上游额度已经刷新。账号的刷新按钮发送 `force: true`，仍遵守端点失败冷却；打开徽标仅普通重读，不强制刷新。刷新失败会保留旧值及其状态，不绕过端点冷却。已打开的设置页和徽标通过连接内的共享内存同步额度读取结果，获焦时只读这份内存，不增加上游请求；获焦不会轮询服务端缓存，既有徽标轮询和手动刷新行为保留。显示偏好不会改变内部 `usedPercent`、账号选择、耗尽保护或冷却策略。账号池成员和最近成功服务账号记录仍由 [#202](https://github.com/V1ki/dsh-plugin-subscriptions/issues/202) 独立跟进；本次未接入 #182、#184、#187 的 Antigravity 汇总端点及分组方案。
 
 ![订阅用量胶囊展开后显示所有服务商与账号](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/usage-badge.png)
 
@@ -68,7 +82,7 @@
 
 只有已登录的 provider 才会出现在会话模型选择器里;登录/退出后列表自动刷新。支持视觉的模型会声明 `['text', 'image']` 输入模态,图片内容会被翻译成各 provider 的 wire 格式。
 
-已登录的卡片还会显示**订阅用量**——按限额窗口(5 小时会话窗、每周窗,以及计划包含的按模型每周窗)展示已用百分比、进度条和重置时间,并带刷新按钮。Codex 用量来自 `chatgpt.com/backend-api/wham/usage`(同时报告计划类型),Claude 用量来自 `api.anthropic.com/api/oauth/usage`,Grok 用量来自 Grok Build CLI 代理的 `cli-chat-proxy.grok.com/v1/billing`(即 CLI `/usage` 面板的数据源,报告共享每周额度和订阅档位)。Antigravity 会在上游字段存在时从 `loadCodeAssist` 与 `fetchAvailableModels` 显示订阅档位、积分及按模型限额。Copilot 没有用量接口,其卡片不显示用量区块。
+已登录的卡片还会显示**订阅用量**——按限额窗口(5 小时会话窗、每周窗,以及计划包含的按模型每周窗)展示已用百分比、进度条和重置时间,并带刷新按钮。Codex 用量来自 `chatgpt.com/backend-api/wham/usage`(同时报告计划类型),Claude 用量来自 `api.anthropic.com/api/oauth/usage`,Grok 用量来自 Grok Build CLI 代理的 `cli-chat-proxy.grok.com/v1/billing`(即 CLI `/usage` 面板的数据源,报告共享每周额度和订阅档位)。Antigravity 从 `retrieveUserQuotaSummary` 显示共享限额，按 Gemini、Claude/GPT 与 Gemini 4 Argon 展示剩余百分比和重置时间；`loadCodeAssist` 提供订阅档位与积分。摘要不可用时仅回退到可选模型的原始限额。Copilot 没有用量接口,其卡片不显示用量区块。
 
 随 provider 启用自动注册的工具:
 
@@ -181,6 +195,10 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
 
 设置和工具策略历史独立存于 `~/.dsh/plugins/subscriptions/provider-settings.json`（权限 0600），不受模型目录刷新影响。原有非空 `models.<provider>` 配置仍决定基础目录；界面显示选择在该目录上生效。
 
+### 记住对话速度
+
+Codex 的 **速度** 控件与 `/fast` 按底层模型（与其独立账号入口共用）记住上次成功选择，切换模型及重启主程序后仍保留。偏好存于 `~/.dsh/plugins/subscriptions/model-speeds.json`（权限 0600），与模型编辑器中的子代理默认速度独立。子代理继续采用已配置的默认值，除非在该会话中明确覆盖。快速路由仍须当前目录声明支持；保存失败时保留上次确认值。未传模型的旧 RPC 调用仍仅对当前会话生效。
+
 ### 编辑模型的默认推理档
 
 默认推理档已合并进 **编辑模型列表**：每个支持推理档的模型在同一处配置显示、推理档和上下文，统一点击对话框底部的 **保存更改** 后生效。隐藏模型也可以设置推理档；没有推理档的模型不显示下拉框。选择「跟随服务商」清除覆盖，取消会恢复尚未保存的编辑。选项取自模型实时能力目录，账号池使用成员共同支持的档位；自定义池别名不提供无效的推理档覆盖。
@@ -241,7 +259,9 @@ Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用
   `account` 填 `status` 接口返回的稳定账号 key——Claude 是邮箱,Grok / Copilot / Antigravity 是登录名。Codex 的 key 同时包含 workspace 和用户(`["<workspace-id>","user","<user-id>"]`),因此 Codex 也可以直接填登录邮箱,或在该 workspace 只登录了一个用户时填 workspace ID;有歧义的引用不会解析到任何账号,以免打到别人的账号。
 - **档位额外项(`tiers`,可选)**：额外的选择器条目,failover 可以跨模型;出现在首个成员所在的 provider 分组。不会自动创建。
 
-成员选择按会话粘性(prompt 缓存不失效),两种策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。任一用量窗口超过 95% 的成员会被硬门槛挡下;首个流式 chunk 之前的失败会记冷却并切换下一家(provider 给了 `retry-after` 就用它)——配额与认证类失败按整个账号冷却(配额是账号级的;Claude 的分模型窗口则只冷却出错成员),瞬时服务端失败只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
+成员选择按会话粘性(prompt 缓存不失效),可选策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。`quota_aware` 会把适用窗口已用 95%～不足 100% 的成员放到后备组，组内仍按消耗速率排序。**所有策略都会跳过任一适用窗口已知达到 100% 的成员，除非该 Codex 账号仍报告有剩余 credits。** 有剩余 credits 的账号仍可用，但排在所有仍有订阅额度的账号之后。当前健康候选全部满额且都没有剩余 credits 时，停止请求并提示额度耗尽。展开的订阅用量面板会显示 credits 余额，并在当前显示的 Codex 账号均满额时提示。外部使用重置卡后，请点击对应账号的 **设置 → 订阅 → 刷新**（用量接口处于失败冷却时仍需等待）。这是基于缓存用量的尽力保护，不是账单硬上限：未知用量仍可用、缓存可能滞后，独立账号/直连及图片视频路由不受此模型账号池保护。在尚未输出内容时，空回复或传输错误会让账号池尝试下一个可用成员，不触发冷却。其他会话仍可使用刚才返回空回复的成员。额度耗尽和限流仍按供应方提供的重试提示或重置时间执行冷却（如有）；通常冷却整个账号，Claude 按模型限制的额度只冷却对应成员。瞬时服务端错误也只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
+
+将 `pool.strategy` 设为 `quota_normalized` 可按窗口消耗进度选账号：用剩余额度比例除以窗口剩余时间比例（后者限制在 0.001 到 1 之间）。窗口总时长或重置时间未知时，仅按剩余额度比例评分，不根据距重置的时间猜测总时长。95% 后备、100% 排除（Codex 仍报告剩余 credits 时除外）及会话粘性规则不变。改回 `quota_aware` 或删除该设置即可恢复默认排序。
 
 ```yaml
 - id: llm-subscriptions
@@ -249,7 +269,7 @@ Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用
   config:
     pool:
       enabled: true                   # 默认开;需同一 provider ≥2 个账号
-      strategy: quota_aware           # 或 priority
+      strategy: quota_aware           # 或 priority / quota_normalized
       switchMargin: 2                 # quota_aware 的滞后切换倍率
       autoAccounts: true              # 把该 provider 各账号自动池到每个目录模型
       families:                       # 某个目录模型的显式账号列表(同一 provider)
@@ -306,6 +326,7 @@ DSH `v0.1.3-alpha.1` 新增宿主统一代理支持。建议在启动环境或 `
 本插件只提供模型路由,审批策略由其他插件负责:
 
 - [`dsh-plugin-auto-review`](https://github.com/delef/dsh-plugin-auto-review) —— 面向 DSH 工具审批的 provider 原生自动审查。它在本插件注册的 `codex` / `grok` 路由(或其他 DSH LLM adapter 的兼容路由)之上,通过 `ctx.llm.stream()` 复现 Codex Guardian 与 Grok 提权审查逻辑,不接触账号与凭据。安装:`dsh plugin --profile web add dsh-plugin-auto-review`。
+- [`dsh-sidebar-session-provider-icon`](https://github.com/prgrmrwy/dsh-sidebar-session-provider-icon) —— 让本插件注册的路由在会话列表里一眼可分：在侧边栏每个会话标题前显示输入框当前选中模型的品牌 logo，不用打开会话就能认出它是 `codex`、`claude`、`grok`、`copilot` 还是聚合路由。数据取自 DSH 自己的模型选择状态，历史会话回退到最近一次请求。它复用宿主模型目录，不直接请求模型提供商。安装：`dsh plugin --profile web add dsh-sidebar-session-provider-icon`。
 
 ## 开发
 

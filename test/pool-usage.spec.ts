@@ -12,10 +12,11 @@ import assert from 'node:assert/strict'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { OAuthEndpointError } from '../src/providers/common.js'
 import type { ProviderUsage } from '../src/providers/common.js'
-import { PoolUsageTracker } from '../src/providers/pool-usage.js'
+import { normalizedWindowUrgency, PoolUsageTracker } from '../src/providers/pool-usage.js'
 import type { ProviderId } from '../src/auth/store.js'
 
 const MEMBER = { provider: 'claude' as const, account: 'a1', model: 'claude-opus-5' }
+const CODEX_MEMBER = { provider: 'codex' as const, account: 'a1', model: 'gpt-5.4' }
 
 const OK_USAGE: ProviderUsage = { supported: true, windows: [{ kind: 'session', usedPercent: 10 }] }
 
@@ -27,7 +28,7 @@ function trackerOf(
   const calls = { count: 0 }
   const tracker = new PoolUsageTracker(
     (provider: ProviderId, account: string) =>
-      provider === MEMBER.provider && account === MEMBER.account
+      (provider === MEMBER.provider || provider === CODEX_MEMBER.provider) && account === MEMBER.account
         ? () => { calls.count += 1; return fetcher() }
         : undefined,
     ttlMs,
@@ -164,8 +165,226 @@ test('snapshotFor: the stale snapshot is carried across consecutive failure cool
   assert.equal(calls.count, 4)
 })
 
+test('quotaFor: remaining Codex credits keep an exhausted window selectable', async () => {
+  const funded = { hasCredits: true, unlimited: false, balance: '13677.11' }
+  const { tracker } = trackerOf(async () => ({ supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }], credits: funded }))
+  const quota = await tracker.quotaFor(CODEX_MEMBER)
+  assert.equal(quota.exhausted, undefined)
+  assert.equal(quota.creditFunded, true)
+  assert.equal(quota.available, false)
+  assert.equal(quota.urgency, 0)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true, 'the same balance does not fund a non-Codex account')
+})
+
+test('quotaFor: a positive balance funds an exhausted window even if hasCredits is false', async () => {
+  const { tracker } = trackerOf(async () => ({
+    supported: true,
+    windows: [{ kind: 'weekly', usedPercent: 100 }],
+    credits: { hasCredits: false, unlimited: false, balance: '10' },
+  }))
+  assert.equal((await tracker.quotaFor(CODEX_MEMBER)).creditFunded, true)
+})
+
+test('quotaFor: a zero balance, overage block, or missing balance flag does not fund an exhausted window', async () => {
+  for (const credits of [
+    { hasCredits: true, unlimited: false, balance: '0' },
+    { hasCredits: true, unlimited: false, overageLimitReached: true },
+    { hasCredits: false, unlimited: false },
+  ]) {
+    const { tracker } = trackerOf(async () => ({ supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }], credits }))
+    assert.equal((await tracker.quotaFor(CODEX_MEMBER)).exhausted, true, JSON.stringify(credits))
+  }
+})
+
+test('quotaFor: a confirmed credit balance survives a usage-endpoint failure', async () => {
+  let fail = false
+  const { tracker } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }], credits: { hasCredits: true, unlimited: true } }
+  }, 0)
+  await tracker.quotaFor(CODEX_MEMBER)
+  fail = true
+  const failed = await tracker.quotaFor(CODEX_MEMBER)
+  assert.equal(failed.creditFunded, true)
+  assert.equal(failed.exhausted, undefined)
+  assert.equal(failed.available, false)
+})
+
+for (const used of [94.99, 95, 99.99, 100, 105]) {
+  test(`quotaFor: raw ${used}% distinguishes near-full from exhausted`, async () => {
+    const { tracker } = trackerOf(async () => ({ supported: true, windows: [{ kind: 'weekly', usedPercent: used }] }))
+    const quota = await tracker.quotaFor(MEMBER)
+    assert.equal(quota.available, used < 95)
+    assert.equal(quota.exhausted === true, used >= 100)
+  })
+}
+
+test('quotaFor: exhaustion applies only to the requested model, even after a fetch failure', async () => {
+  let fail = false
+  const { tracker } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [
+      { kind: 'weekly', scope: 'opus', usedPercent: 100, resetsAt: Date.now() - 1000 },
+      { kind: 'weekly', scope: 'sonnet', usedPercent: 20 },
+    ] }
+  })
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true, 'reset timestamp alone does not confirm a reset')
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+  fail = true
+  await tracker.snapshotFor(MEMBER.provider, MEMBER.account, true)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+})
+
+test('quotaFor: exhausted snapshot awaits expired refresh and restores routing on the same call', async () => {
+  let finish: ((usage: ProviderUsage) => void) | undefined
+  let reads = 0
+  const { tracker, calls } = trackerOf(async () => {
+    if (++reads === 1) return { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] }
+    return new Promise<ProviderUsage>(resolve => { finish = resolve })
+  }, 0)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  const pending = tracker.quotaFor(MEMBER)
+  const duplicate = tracker.quotaFor(MEMBER)
+  assert.equal(calls.count, 2, 'concurrent reads share the recovery fetch')
+  assert.ok(finish)
+  finish(OK_USAGE)
+  assert.equal((await pending).available, true)
+  assert.equal((await duplicate).exhausted, undefined)
+})
+
+test('quotaFor: exhausted status survives consecutive usage failures and their cooldowns', async () => {
+  let fail = false
+  const { tracker, calls } = trackerOf(async () => {
+    if (fail) throw new OAuthEndpointError('limited', 429, undefined, 60_000)
+    return { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] }
+  }, 0)
+  await tracker.quotaFor(MEMBER)
+  fail = true
+  const failed = await tracker.quotaFor(MEMBER)
+  assert.equal(failed.exhausted, true)
+  assert.equal(failed.urgency, 0)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal(calls.count, 2, 'live cooldown is respected')
+})
+
+test('quotaFor: inference invalidation preserves exhausted model lanes through failed refresh', async () => {
+  let fail = false
+  const { tracker, calls } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [{ kind: 'weekly', scope: 'opus', usedPercent: 100 }] }
+  })
+  await tracker.quotaFor(MEMBER)
+  tracker.expire(MEMBER.provider, MEMBER.account)
+  fail = true
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  tracker.expire(MEMBER.provider, MEMBER.account)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal(calls.count, 2, 'inference expiration does not bypass the usage-endpoint cooldown')
+})
+
+test('quotaFor: repeated failed recovery attempts retain exhaustion until a successful lookup', async () => {
+  let used = 100
+  let fail = false
+  const { tracker } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [{ kind: 'weekly', usedPercent: used }] }
+  }, 0)
+  await tracker.quotaFor(MEMBER)
+  fail = true
+  for (let i = 0; i < 3; i++) assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  fail = false
+  used = 0
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, undefined)
+})
+
 test('snapshotFor: a rate limit with no prior success still throws (nothing to fall back to)', async () => {
   const error = new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 60_000)
   const { tracker } = trackerOf(() => Promise.reject(error))
   await assert.rejects(tracker.snapshotFor('claude', 'a1'), error)
+})
+
+test('normalized urgency uses total duration, never guesses from time to reset', () => {
+  const hour = 3600000
+  const now = 1_800_000_000_000
+  const score = (duration: number | undefined, left: number, used = 0) => normalizedWindowUrgency({
+    kind: 'other', usedPercent: used, resetsAt: now + left,
+    ...(duration === undefined ? {} : { durationMs: duration }),
+  }, now)
+  for (const length of [3, 5, 7 * 24]) {
+    assert.equal(score(length * hour, length * hour), 1)
+    assert.equal(score(length * hour, length * hour / 2), 2)
+  }
+  const scores = [-1, 0, 1].map(ms => score(24 * hour, 6 * hour + ms))
+  assert.equal(scores[1], 4)
+  assert.ok(scores[0] > scores[1] && scores[1] > scores[2] && scores[0] - scores[2] < 0.000001)
+  for (const duration of [undefined, 0, NaN, Infinity]) {
+    for (const left of [-1, 6 * hour - 1, 6 * hour + 1]) assert.equal(score(duration, left, 25), 0.75)
+  }
+  assert.equal(normalizedWindowUrgency({kind: 'other', usedPercent: 25, durationMs: hour}, now), 0.75)
+  assert.equal(score(hour, -1), 1000)
+  assert.equal(score(hour, -1, 100), 0)
+})
+
+test('Antigravity grouped pools respect exhausted concrete variant quotas', async () => {
+  const usage: ProviderUsage = { supported: true, windows: [
+    { kind: 'other', scope: 'gemini-4-argon-high', usedPercent: 100 },
+    { kind: 'other', scope: 'claude-opus-5-5-medium', usedPercent: 20 },
+  ] }
+  const tracker = new PoolUsageTracker(() => async () => usage)
+  const member = { provider: 'antigravity' as const, account: 'test', model: 'gemini-4-argon' }
+  assert.equal((await tracker.quotaFor(member)).available, false)
+  assert.equal((await tracker.quotaFor({ ...member, model: 'claude-opus-5-5' })).available, true)
+})
+
+test('shared Antigravity Gemini quotas also constrain Argon and retain explicit extra limits', async () => {
+  const tracker = new PoolUsageTracker(() => async () => ({ supported: true, windows: [
+    { kind: 'weekly', scope: 'Gemini Models', usedPercent: 100 },
+    { kind: 'session', scope: 'Claude and GPT models', usedPercent: 100 },
+    { kind: 'weekly', scope: 'Gemini 4 Argon', usedPercent: 33 },
+  ] }))
+  const member = { provider: 'antigravity' as const, account: 'test', model: 'gemini-3.8-flash' }
+  assert.equal((await tracker.quotaFor(member)).available, false)
+  assert.equal((await tracker.quotaFor({ ...member, model: 'claude-opus-5-5' })).available, false)
+  assert.equal((await tracker.quotaFor({ ...member, model: 'gpt-oss-120b' })).available, false)
+  assert.equal((await tracker.quotaFor({ ...member, model: 'gemini-4-argon' })).available, false)
+})
+
+test('display snapshots preserve timestamps across failure/expiry and leave routing snapshots untouched', async () => {
+  let failed = false
+  const raw: ProviderUsage = { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] }
+  const { tracker, calls } = trackerOf(async () => {
+    if (failed) throw new OAuthEndpointError('synthetic private error', 429, undefined, 10)
+    return raw
+  }, 10)
+  const first = await tracker.displaySnapshotFor(MEMBER.provider, MEMBER.account)
+  assert.equal(first.stale, false)
+  assert.ok(first.fetchedAt! > 0)
+  assert.equal(first.staleAt, first.fetchedAt! + 10)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal(await tracker.snapshotFor(MEMBER.provider, MEMBER.account), raw)
+  failed = true
+  tracker.expire(MEMBER.provider, MEMBER.account)
+  const second = await tracker.displaySnapshotFor(MEMBER.provider, MEMBER.account)
+  assert.equal(second.fetchedAt, first.fetchedAt)
+  assert.equal(second.stale, true)
+  assert.equal(second.refreshFailed, true)
+  assert.ok(second.retryAt! >= second.fetchedAt!)
+  assert.equal('error' in second, false)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.deepEqual(await tracker.displaySnapshotFor(MEMBER.provider, MEMBER.account, true), second)
+  assert.equal(calls.count, 2)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  const third = await tracker.displaySnapshotFor(MEMBER.provider, MEMBER.account)
+  assert.equal(third.fetchedAt, first.fetchedAt)
+  assert.equal(third.stale, true)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  failed = false
+  const recovered = await tracker.displaySnapshotFor(MEMBER.provider, MEMBER.account)
+  assert.equal(recovered.stale, false)
+  assert.equal(recovered.refreshFailed, false)
+  assert.equal(recovered.retryAt, undefined)
+  assert.ok(recovered.fetchedAt! > first.fetchedAt!)
+  assert.deepEqual(raw, { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] })
 })

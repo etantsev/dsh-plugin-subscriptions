@@ -1,13 +1,7 @@
 {
-<<<<<<< HEAD
   "name": "dsh-plugin-subscriptions-kimi",
-  "version": "0.9.12-kimi.2",
+  "version": "0.9.13-kimi.1",
   "description": "Fork of dsh-plugin-subscriptions with Kimi Code (kimi.com / kimi.ai) OAuth login: use ChatGPT (Codex), Claude, Grok (X Premium), GitHub Copilot, Google Antigravity, and Kimi Code subscriptions as DeepSeek Harness LLM providers. Disable the original dsh-plugin-subscriptions bundle before enabling this one.",
-=======
-  "name": "dsh-plugin-subscriptions",
-  "version": "0.9.13",
-  "description": "Use ChatGPT (Codex), Claude, Grok (X Premium), GitHub Copilot, and Google Antigravity subscriptions as DeepSeek Harness LLM providers, with OAuth login from the web Settings page",
->>>>>>> upstream/main
   "license": "MIT",
   "repository": {
     "type": "git",

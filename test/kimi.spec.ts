@@ -45,11 +45,12 @@ function jwt(claims: Record<string, unknown>): string {
   return `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`
 }
 
-test('kimi device flow: form-encoded client id, X-Msh headers, full token response', async () => {
+test('kimi device flow: transport retries preserve request headers and the full token response', async () => {
   const seen: { url: string; headers: Record<string, string>; body: string }[] = []
   const fetchFn = ((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     seen.push({ url, headers: init?.headers as Record<string, string>, body: String(init?.body) })
+    if (seen.filter(entry => entry.url === url).length === 1) return Promise.reject(new Error('read ECONNRESET'))
     if (url === KIMI_DEVICE_CODE_URL) {
       return Promise.resolve(new Response(JSON.stringify({
         device_code: 'dc', user_code: 'WXYZ-1234', verification_uri: 'https://www.kimi.com/code/authorize_device',
@@ -74,9 +75,14 @@ test('kimi device flow: form-encoded client id, X-Msh headers, full token respon
   assert.equal(params.has('scope'), false)
   assert.equal(device.headers['x-msh-platform'], 'kimi_cli')
   assert.match(device.headers['x-msh-device-id'], /^[0-9a-f]{32}$/)
-  const poll = seen.find(entry => entry.url === KIMI_TOKEN_URL)!
-  assert.equal(new URLSearchParams(poll.body).get('grant_type'), 'urn:ietf:params:oauth:grant-type:device_code')
-  assert.equal(poll.headers['x-msh-device-id'], device.headers['x-msh-device-id'])
+  const devices = seen.filter(entry => entry.url === KIMI_DEVICE_CODE_URL)
+  const polls = seen.filter(entry => entry.url === KIMI_TOKEN_URL)
+  assert.deepEqual(devices, [device, device])
+  assert.equal(polls.length, 2)
+  for (const poll of polls) {
+    assert.equal(new URLSearchParams(poll.body).get('grant_type'), 'urn:ietf:params:oauth:grant-type:device_code')
+    assert.deepEqual(poll.headers, device.headers)
+  }
 })
 
 test('kimi login: session carries refresh token, expiry, and claim identity', () => {

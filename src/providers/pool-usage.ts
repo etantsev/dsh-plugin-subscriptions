@@ -221,14 +221,19 @@ export class PoolUsageTracker {
     if (entry?.snapshot !== undefined) this.entries.set(key, { ...entry, at: Number.NEGATIVE_INFINITY })
   }
 
-  /** Drop cached snapshots: one account, or a whole provider when `account` is omitted. */
+  /** Drop snapshots and detach pending lookups from before the account change. */
   invalidate(provider: ProviderId, account?: string): void {
+    const forget = (key: string): void => {
+      this.entries.delete(key)
+      this.inflight.delete(key)
+    }
     if (account !== undefined) {
-      this.entries.delete(`${provider}/${account}`)
+      forget(`${provider}/${account}`)
       return
     }
-    for (const key of [...this.entries.keys()]) {
-      if (key.startsWith(`${provider}/`)) this.entries.delete(key)
+    const prefix = `${provider}/`
+    for (const key of new Set([...this.entries.keys(), ...this.inflight.keys()])) {
+      if (key.startsWith(prefix)) forget(key)
     }
   }
 
@@ -254,11 +259,11 @@ export class PoolUsageTracker {
       pending = fetcher().then(
         (snapshot) => {
           const fetchedAt = Date.now()
-          this.entries.set(key, { snapshot, at: fetchedAt, fetchedAt })
+          if (this.inflight.get(key) === pending) this.entries.set(key, { snapshot, at: fetchedAt, fetchedAt })
           return snapshot
         },
         (error: unknown) => {
-          if (!isMissingOrInvalidCredential(error)) {
+          if (this.inflight.get(key) === pending && !isMissingOrInvalidCredential(error)) {
             this.entries.set(key, {
               error,
               at: Date.now(),
@@ -270,7 +275,7 @@ export class PoolUsageTracker {
           throw error
         },
       ).finally(() => {
-        this.inflight.delete(key)
+        if (this.inflight.get(key) === pending) this.inflight.delete(key)
       })
       this.inflight.set(key, pending)
     }
@@ -336,9 +341,10 @@ function cooldownFor(error: unknown, defaultTtlMs: number): number {
 /**
  * Whether a window constrains this model: unscoped windows always do; a
  * model-scoped window (Claude's Opus/Sonnet lanes) applies when its scope
- * names the model family.
+ * names the model family. Exported for the usage window tracker, which
+ * places request counts by the same rule routing scores quota by.
  */
-function windowApplies(window: UsageWindow, model: string, provider: ProviderId): boolean {
+export function windowApplies(window: Pick<UsageWindow, 'scope'>, model: string, provider: ProviderId): boolean {
   if (window.scope === undefined) return true
   if (provider === 'antigravity' && antigravityQuotaApplies(window.scope, model)) return true
   return model.toLowerCase().includes(window.scope.toLowerCase())

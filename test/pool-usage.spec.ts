@@ -86,6 +86,31 @@ test('snapshotFor: a live failure cooldown is never bypassed, even by a forced (
   assert.equal(calls.count, 1, 'force must not punch through an active cooldown')
 })
 
+test('snapshotFor: an old Kimi refresh failure cannot poison usage after re-login', async () => {
+  const oldError = new LlmError('Kimi Code token refresh failed', 'AUTH')
+  for (const account of ['a1', undefined]) {
+    let rejectOld!: (error: Error) => void
+    let resolveNew!: (usage: ProviderUsage) => void
+    let calls = 0
+    const tracker = new PoolUsageTracker(() => () => ++calls === 1
+      ? new Promise((_, reject) => { rejectOld = reject })
+      : new Promise(resolve => { resolveNew = resolve }))
+    const old = tracker.snapshotFor('kimi', 'a1')
+    const rejected = assert.rejects(old, oldError)
+    tracker.invalidate('kimi', account)
+    const fresh = tracker.snapshotFor('kimi', 'a1', true)
+    assert.equal(calls, 2, 'a new login must not join a lookup using the old credentials')
+    rejectOld(oldError)
+    await rejected
+    const joined = tracker.snapshotFor('kimi', 'a1', true)
+    assert.equal(calls, 2, 'the old lookup must not clear the replacement lookup')
+    resolveNew(OK_USAGE)
+    assert.deepEqual(await fresh, OK_USAGE)
+    assert.deepEqual(await joined, OK_USAGE)
+    assert.deepEqual(await tracker.snapshotFor('kimi', 'a1'), OK_USAGE)
+  }
+})
+
 test('snapshotFor: force bypasses a fresh SUCCESS cache for an honest re-check', async () => {
   const { tracker, calls } = trackerOf(() => Promise.resolve(OK_USAGE))
   await tracker.snapshotFor('claude', 'a1')
